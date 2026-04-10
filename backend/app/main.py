@@ -1,136 +1,214 @@
-"""
-app/main.py
------------
-FastAPI application factory and entry point.
+# main.py  — drop-in replacement / addition for your existing FastAPI backend
+# Wires together: multilingual support, emotional manipulation, source credibility, MongoDB
 
-Responsibilities
-----------------
-- Create and configure the FastAPI application instance.
-- Register CORS middleware.
-- Mount the API router.
-- Configure structured logging for the whole application.
-- Expose a lifespan context manager for startup / shutdown hooks.
-"""
-
-from __future__ import annotations
-
-import logging
-import sys
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
-
-import nltk
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
+import os
 
-from app.api.routes import router
-from app.core.config import settings
+from language_utils import process_multilingual_input
+from emotional_manipulation import analyze_emotional_manipulation
+from source_credibility import check_source_credibility, fetch_related_verified_articles
+from database import save_analysis, get_analysis_history, get_analysis_by_id, ensure_indexes
 
+app = FastAPI(title="Fake News & Misinformation Detector API", version="2.0")
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def configure_logging() -> None:
-    """
-    Set up a clean, consistent logging format for the entire application.
-    Uses StreamHandler (stdout) so logs surface correctly in Docker / cloud envs.
-    """
-    log_level = logging.DEBUG if settings.DEBUG else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    # Silence overly verbose third-party loggers
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("newspaper").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 
-configure_logging()
-logger = logging.getLogger(__name__)
-
-
-# ── Lifespan ──────────────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """
-    Async context manager that wraps the application's lifespan.
-
-    Startup:
-      - Warm up NLTK resources (already downloaded by nlp_service at import
-        time, but we log confirmation here).
-      - Any future startup tasks (DB connection pools, ML model loading) go here.
-
-    Shutdown:
-      - Clean teardown (DB pool close, etc.) would go here.
-    """
-    logger.info("═══════════════════════════════════════")
-    logger.info("  %s  v%s", settings.APP_NAME, settings.APP_VERSION)
-    logger.info("═══════════════════════════════════════")
-    logger.info("Starting up…")
-
-    # Trigger nlp_service import so NLTK data is downloaded before the first request
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup():
     try:
-        from app.services import nlp_service  # noqa: F401
-        logger.info("NLP service initialised successfully.")
-    except Exception as exc:
-        logger.error("Failed to initialise NLP service: %s", exc)
-
-    logger.info("Server ready on http://%s:%d", settings.HOST, settings.PORT)
-    logger.info("API docs available at http://%s:%d/docs", settings.HOST, settings.PORT)
-
-    yield  # ← application runs here
-
-    logger.info("Shutting down %s…", settings.APP_NAME)
+        await ensure_indexes()
+    except Exception as e:
+        print(f"[WARN] MongoDB not connected: {e}")
 
 
-# ── Application factory ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+from app.models.schema import AnalyzeRequest, AnalyzeResponse
 
-def create_app() -> FastAPI:
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _compute_credibility_score(
+    fake_news_probability: float,
+    manipulation_score: int,
+    source_score: Optional[int],
+) -> int:
     """
-    Construct and return the configured FastAPI application.
-    Keeping this in a factory function makes the app easy to test in isolation.
+    Combine ML fake-news probability + manipulation + source scores
+    into a final 0-100 credibility score.
     """
-    app = FastAPI(
-        title=settings.APP_NAME,
-        version=settings.APP_VERSION,
-        description=(
-            "A production-ready API that analyses news articles for signs of "
-            "misinformation and returns a credibility score with an explanatory label."
-        ),
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
-        lifespan=lifespan,
-    )
+    # Base score from ML model (fake_news_probability = 0 means real, 1 = fake)
+    ml_score = int((1 - fake_news_probability) * 100)
 
-    # ── CORS ──────────────────────────────────────────────────────────────────
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # Weighted blend
+    weights = {"ml": 0.5, "manipulation": 0.25, "source": 0.25}
+    manipulation_credibility = 100 - manipulation_score
 
-    # ── Routers ───────────────────────────────────────────────────────────────
-    app.include_router(router, prefix="/api/v1")
-
-    # ── Global exception handler ──────────────────────────────────────────────
-    @app.exception_handler(Exception)
-    async def unhandled_exception_handler(request, exc: Exception) -> JSONResponse:  # type: ignore[type-arg]
-        logger.exception("Unhandled exception: %s", exc)
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "An unexpected internal error occurred."},
+    if source_score is not None:
+        final = (
+            ml_score * weights["ml"]
+            + manipulation_credibility * weights["manipulation"]
+            + source_score * weights["source"]
         )
+    else:
+        # Redistribute source weight to ml if no source available
+        final = ml_score * 0.65 + manipulation_credibility * 0.35
 
-    return app
+    return max(0, min(100, int(final)))
 
 
-# Singleton exported to uvicorn
-app = create_app()
+from textblob import TextBlob
+
+FAKE_KEYWORDS = [
+    "shocking", "breaking", "exclusive", "conspiracy", "hoax",
+    "exposed", "secret", "they don't want you to know", "cover-up",
+    "miracle", "banned", "censored", "wake up", "deep state"
+]
+
+def _get_fake_news_probability(english_text: str) -> float:
+    """
+    Derives a fake probability from keyword hits + TextBlob subjectivity.
+    Returns a float 0.0 (real) to 1.0 (fake).
+    """
+    text_lower = english_text.lower()
+
+    # Keyword score — each hit adds weight
+    keyword_hits = sum(1 for kw in FAKE_KEYWORDS if kw in text_lower)
+    keyword_score = min(keyword_hits / 5, 1.0)  # caps at 1.0 after 5 hits
+
+    # Subjectivity score from TextBlob (0 = objective, 1 = very subjective)
+    blob = TextBlob(english_text)
+    subjectivity = blob.sentiment.subjectivity
+
+    # Weighted combination
+    fake_probability = (keyword_score * 0.6) + (subjectivity * 0.4)
+    return round(min(fake_probability, 1.0), 3)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(request: AnalyzeRequest):
+    if not request.text or len(request.text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Text too short to analyze.")
+
+    # 1. Language detection + translation
+    lang_data = process_multilingual_input(request.text)
+    english_text = lang_data["english_text"]
+    language_info = lang_data["language_info"]
+
+    # 2. ML fake-news probability on English text
+    fake_prob = _get_fake_news_probability(english_text)
+
+    # 3. Emotional manipulation analysis
+    manipulation_data = analyze_emotional_manipulation(request.text)
+
+    # 4. Source credibility (only if URL provided)
+    source_data = None
+    verified_sources = []
+    if request.url:
+        source_data = check_source_credibility(request.url)
+        # Fetch related verified articles from NewsAPI
+        # Use first 5 words of text as search query
+        query_words = english_text.split()[:5]
+        query = " ".join(query_words)
+        verified_sources = await fetch_related_verified_articles(query, NEWS_API_KEY)
+
+    # 5. Final credibility score
+    source_score = source_data["credibility_score"] if source_data else None
+    credibility_score = _compute_credibility_score(fake_prob, manipulation_data["manipulation_score"], source_score)
+
+    # 6. Persist to MongoDB
+    result_doc = {
+        "input_text": request.text[:500],  # store excerpt
+        "url": request.url,
+        "user_id": None,
+        "credibility_score": credibility_score,
+        "manipulation_score": manipulation_data["manipulation_score"],
+        "risk_level": manipulation_data["risk_level"],
+        "language_code": language_info.get("language_code"),
+        "flags": manipulation_data["flags"],
+        "sentiment": manipulation_data.get("sentiment"),
+        "source_info": source_data,
+    }
+    try:
+        analysis_id = await save_analysis(result_doc)
+    except Exception:
+        analysis_id = None  # don't fail if DB is down
+
+    blob = TextBlob(lang_data["english_text"])
+    polarity = blob.sentiment.polarity
+    subjectivity = blob.sentiment.subjectivity
+
+    if polarity <= -0.6:   sentiment_label = "Very Negative"
+    elif polarity <= -0.1: sentiment_label = "Negative"
+    elif polarity <= 0.1:  sentiment_label = "Neutral"
+    elif polarity <= 0.6:  sentiment_label = "Positive"
+    else:                  sentiment_label = "Very Positive"
+
+    if credibility_score >= 70:   verdict = "Likely Real"
+    elif credibility_score >= 40: verdict = "Suspicious"
+    else:                         verdict = "Fake"
+
+    detected_keywords = [
+        kw for kw in FAKE_KEYWORDS
+        if kw in lang_data["english_text"].lower()
+    ]
+
+    return AnalyzeResponse(
+        cleaned_text=lang_data["english_text"],
+        score=float(credibility_score),
+        label=verdict,
+        keywords_detected=detected_keywords,
+        sentiment=sentiment_label,
+        sentiment_polarity=round(polarity, 3),
+        sentiment_subjectivity=round(subjectivity, 3),
+        word_count=len(lang_data["english_text"].split()),
+        source="url" if request.url else "text",
+    )
+
+
+@app.get("/history")
+async def history(limit: int = 20, skip: int = 0):
+    """Return recent analysis history from MongoDB."""
+    try:
+        return await get_analysis_history(limit=limit, skip=skip)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
+
+
+@app.get("/history/{analysis_id}")
+async def history_detail(analysis_id: str):
+    """Return a single analysis result by ID."""
+    try:
+        doc = await get_analysis_by_id(analysis_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Analysis not found.")
+        return doc
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}

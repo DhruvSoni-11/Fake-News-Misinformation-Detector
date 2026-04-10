@@ -16,6 +16,7 @@ newspaper4k==0.9.3.1      # maintained fork of newspaper3k
 nltk==3.9.1
 textblob==0.18.0.post0
 
+
 # ── Optional: Multilingual support ────────────────────────────────────────────
 # Uncomment to enable automatic language detection + translation:
 # deep-translator==1.11.4
@@ -24,3 +25,31 @@ textblob==0.18.0.post0
 # ── Dev / Testing ─────────────────────────────────────────────────────────────
 # pytest==8.3.3
 # pytest-asyncio==0.24.0
+
+# backend/requirements.txt
+
+# ── Already likely in your project ────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+scikit-learn
+numpy
+
+# ── New dependencies for missing features ─────────────────────────────────
+
+# Multilingual support (Hindi + 10 Indian languages)
+deep-translator==1.11.4       # Free Google Translate wrapper — no API key needed
+langdetect==1.0.9             # Language detection
+
+# MongoDB Atlas async driver
+motor==3.4.0                  # Async MongoDB (uses PyMongo under the hood)
+pymongo[srv]==4.7.2           # Required by motor for Atlas SRV connection strings
+
+# Source credibility / News API calls
+                # Async HTTP client
+
+# Emotional manipulation (optional transformer-based sentiment)
+# Uncomment if you want the richer sentiment analysis — adds ~500MB model download
+# transformers==4.41.0
+# torch==2.3.0
