@@ -1,11 +1,15 @@
 import React from 'react';
-import Home from './pages/Home';
-import './styles.css';
+import Analyzer from './components/Analyzer';
+import Header from './components/Header';
+import './App.css';
 
 function App() {
   return (
     <div className="App">
-      <Home />
+      <Header />
+      <main className="main-content">
+        <Analyzer />
+      </main>
     </div>
   );
 }

@@ -1,0 +1,24 @@
+.highlighted-text {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.75;
+  color: var(--text-secondary);
+  background: rgba(0,0,0,0.2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1rem 1.2rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.suspicious-phrase {
+  background: rgba(255, 59, 59, 0.18);
+  color: var(--accent-red);
+  border-radius: 3px;
+  padding: 0 2px;
+  border-bottom: 1px solid rgba(255, 59, 59, 0.45);
+  cursor: help;
+  font-style: normal;
+}
